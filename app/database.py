@@ -65,6 +65,57 @@ CREATE TABLE IF NOT EXISTS generations (
     superseded_at       TEXT
 );
 
+-- Planned meter-reading imports. Every successful upload is an immutable
+-- full snapshot; the current plan is the latest committed plan batch. Old
+-- snapshots stay intact so historical checks remain auditable.
+CREATE TABLE IF NOT EXISTS plan_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename        TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('committed','rejected')),
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    reject_reason   TEXT,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_points (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL REFERENCES plan_batches(id),
+    account     TEXT NOT NULL,
+    meter       TEXT NOT NULL,
+    planned_at  TEXT NOT NULL,            -- ISO-8601 UTC planned read time
+    created_at  TEXT NOT NULL,
+    UNIQUE (batch_id, account, meter, planned_at)
+);
+
+-- One verification run over one committed input snapshot. Only one check may
+-- be active at a time; any later committed upload (or a newer check) expires
+-- it so stale conclusions never stand in as the current gap.
+CREATE TABLE IF NOT EXISTS checks (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    status              TEXT NOT NULL CHECK (status IN ('active','expired')),
+    status_detail       TEXT,
+    plan_batch_id       INTEGER NOT NULL REFERENCES plan_batches(id),
+    reading_batch_ids   TEXT NOT NULL,    -- comma separated committed reading batch ids at check time
+    replacement_batch_id INTEGER,          -- latest committed replacement batch id at check time
+    created_at          TEXT NOT NULL,
+    superseded_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS check_results (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    check_id            INTEGER NOT NULL REFERENCES checks(id),
+    plan_point_id       INTEGER NOT NULL REFERENCES plan_points(id),
+    account             TEXT NOT NULL,
+    meter               TEXT NOT NULL,
+    planned_at          TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('MATCHED','MISSED','MIS_SCHEDULED','PENDING_REVIEW')),
+    match_reading_id    INTEGER,
+    match_read_at       TEXT,
+    match_reading_cum   REAL,
+    delta_seconds       REAL,
+    detail              TEXT                -- review / mis-schedule explanation
+);
+
 CREATE TABLE IF NOT EXISTS result_rows (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     generation_id       INTEGER NOT NULL REFERENCES generations(id),
@@ -84,7 +135,9 @@ CREATE TABLE IF NOT EXISTS result_rows (
 CREATE INDEX IF NOT EXISTS idx_readings_lookup ON readings(account, meter, read_at);
 CREATE INDEX IF NOT EXISTS idx_replacements_acct ON replacements(account);
 CREATE INDEX IF NOT EXISTS idx_results_gen ON result_rows(generation_id);
-"""
+CREATE INDEX IF NOT EXISTS idx_plan_points_batch ON plan_points(batch_id, account, meter, planned_at);
+CREATE INDEX IF NOT EXISTS idx_check_results_check ON check_results(check_id, id);
+""".strip()
 
 
 def init_db(db_path: str | os.PathLike | None = None) -> Path:

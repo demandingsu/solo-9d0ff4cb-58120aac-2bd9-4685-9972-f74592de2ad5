@@ -186,6 +186,16 @@ def _expire_active_generation(conn: sqlite3.Connection) -> None:
     )
 
 
+def _expire_active_check(conn: sqlite3.Connection) -> None:
+    """A new committed reading / replacement snapshot invalidates the gap check.
+
+    Imported lazily to avoid a circular import (plan.py imports this module).
+    """
+    from .plan import expire_active_checks
+
+    expire_active_checks(conn, "读数或换表输入已更新，旧核查结论过期")
+
+
 def _record_rejected_batch(conn: sqlite3.Connection, batch_type: str,
                            filename: str, reason: str) -> None:
     """Persist the rejection itself as an audit record (never partial data)."""
@@ -229,6 +239,7 @@ def ingest_readings(conn: sqlite3.Connection, filename: str, text: str) -> dict:
             ],
         )
         _expire_active_generation(conn)
+        _expire_active_check(conn)
         conn.commit()
     except BatchRejected as exc:
         conn.rollback()
@@ -261,6 +272,7 @@ def ingest_replacements(conn: sqlite3.Connection, filename: str, text: str) -> d
             ],
         )
         _expire_active_generation(conn)
+        _expire_active_check(conn)
         conn.commit()
     except BatchRejected as exc:
         conn.rollback()

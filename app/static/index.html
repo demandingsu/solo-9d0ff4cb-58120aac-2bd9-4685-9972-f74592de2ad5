@@ -31,6 +31,15 @@
   .badge.rejected { background:#ffebe9; color:var(--red); }
   .badge.OK { background:#dafbe1; color:var(--green); }
   .badge.REVIEW { background:#fff8c5; color:var(--amber); }
+  .badge.MATCHED { background:#dafbe1; color:var(--green); }
+  .badge.MISSED { background:#ffebe9; color:var(--red); }
+  .badge.MIS_SCHEDULED { background:#ddf4ff; color:var(--blue); }
+  .badge.PENDING_REVIEW { background:#fff8c5; color:var(--amber); }
+  .stale-banner { background:#fff8c5; border:1px solid #d4a72c; color:#7d4e00;
+                  padding:10px 14px; border-radius:8px; font-size:13px; margin-bottom:12px; }
+  .summary { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; }
+  .summary .stat { border:1px solid var(--border); border-radius:8px; padding:8px 14px; font-size:13px; }
+  .summary .stat b { font-size:16px; display:block; }
   #toast { position:fixed; right:20px; bottom:20px; max-width:420px; display:grid; gap:8px; z-index:10; }
   .toast { padding:12px 16px; border-radius:8px; color:#fff; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,.15); }
   .toast.ok { background:var(--green); }
@@ -48,9 +57,36 @@
   <p>读数 / 换表 CSV 上传 · 区间用量生成 · 待核标注 · 结果下载（全部时刻按 UTC 处理）</p>
 </header>
 <main>
+  <section class="card">
+    <h2>计划核查：找出真正的漏采点</h2>
+    <p class="hint">
+      导入计划 CSV（表头 <code>account,meter,planned_at</code>，整版快照，时刻按 UTC）。
+      核查使用<b>同一份已提交输入快照</b>：计划点与实读都须在该表服务窗口内，实读与计划时刻相差
+      ≤15 分钟才可核销；一笔实读最多核销一个计划点，候选重叠时按“核销点数最多”求解。
+      窗口外计划点标<b>错排</b>，账户缺换表记录的标<b>待核</b>，均不计为漏采。
+      新读数/换表/计划提交后，旧核查结论自动标过期，重新核查前不再作为现行缺口。
+    </p>
+    <div class="row">
+      <input type="file" id="planFile" accept=".csv,text/csv">
+      <button class="primary" onclick="uploadPlan()">导入计划 CSV</button>
+      <button class="primary" onclick="runCheck()">以当前已提交输入核查</button>
+    </div>
+    <div class="scroll">
+      <table id="checkTable">
+        <thead><tr>
+          <th>核查</th><th>状态</th><th>核查时间 (UTC)</th><th>计划点</th>
+          <th>已核销</th><th>漏采</th><th>错排</th><th>待核</th>
+          <th>所用计划批次</th><th>所用读数批次</th><th>所用换表批次</th><th>下载</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="checkDetail"></div>
+  </section>
+
   <section class="card grid2">
     <div>
-      <h2>① 增量上传：累计读数 CSV</h2>
+      <h2>③ 增量上传：累计读数 CSV</h2>
       <p class="hint">表头：<code>account,meter,read_at,reading_cum</code><br>
         同表同时同值重传自动只计一次；异值整批拒收（HTTP 422）。</p>
       <div class="row">
@@ -59,7 +95,7 @@
       </div>
     </div>
     <div>
-      <h2>② 整版上传：换表 CSV（每户一条）</h2>
+      <h2>④ 整版上传：换表 CSV（每户一条）</h2>
       <p class="hint">表头：<code>account,old_meter,new_meter,switched_at</code><br>
         整版替换：新文件提交后旧换表数据整体失效，并使旧结果过期。</p>
       <div class="row">
@@ -70,7 +106,7 @@
   </section>
 
   <section class="card">
-    <h2>③ 生成现役结果</h2>
+    <h2>⑤ 生成现役结果（区间用量）</h2>
     <p class="hint">仅基于当前已提交的全部输入完整生成；与上传交错时，生成期间新提交的输入不会被半包纳入。
       生成失败时不发布新结果，上一版结果仍可下载并标记为过期。</p>
     <div class="row">
@@ -163,7 +199,110 @@ function esc(v) {
   return String(v ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
-async function loadAll() {
+async function uploadPlan() {
+  const input = document.getElementById('planFile');
+  if (!input.files.length) { toast('请先选择计划 CSV', false); return; }
+  const fd = new FormData();
+  fd.append('file', input.files[0]);
+  try {
+    const resp = await fetch('/api/uploads/plans', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+    toast(data.message);
+  } catch (e) {
+    toast('计划导入被拒收：' + e.message, false);
+  }
+  loadAll();
+}
+
+async function runCheck() {
+  try {
+    const resp = await fetch('/api/checks', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+    toast(data.message);
+    loadAll(data.detail.check_id);
+  } catch (e) {
+    toast('核查失败：' + e.message, false);
+  }
+}
+
+const CHECK_STATUS_LABEL = { MATCHED:'已核销', MISSED:'漏采', MIS_SCHEDULED:'错排', PENDING_REVIEW:'待核' };
+
+async function loadChecks(showId) {
+  const resp = await fetch('/api/checks');
+  const checks = (await resp.json()).checks;
+
+  document.querySelector('#checkTable tbody').innerHTML = checks.map(c => `
+    <tr>
+      <td>${c.id}</td>
+      <td><span class="badge ${c.stale ? 'expired' : 'active'}">${c.stale ? '过期' : '现行'}</span></td>
+      <td>${esc(c.created_at)}</td>
+      <td>${c.total_points}</td><td>${c.matched}</td><td>${c.missed}</td>
+      <td>${c.mis_scheduled}</td><td>${c.pending_review}</td>
+      <td>${c.plan_batch_id}</td>
+      <td>${esc(c.reading_batch_ids || '')}</td>
+      <td>${esc(c.replacement_batch_id ?? '')}</td>
+      <td><a class="dl" href="/api/checks/${c.id}/download">下载 CSV</a>
+          · <a class="dl" href="#" onclick="showCheck(${c.id}); return false;">查看明细</a></td>
+    </tr>`).join('') || '<tr><td colspan="12" style="color:#656d76">尚无核查</td></tr>';
+
+  const target = showId ?? (checks.find(c => !c.stale) || checks[0])?.id;
+  if (target) showCheck(target);
+  else document.getElementById('checkDetail').innerHTML = '';
+  return checks;
+}
+
+async function showCheck(checkId) {
+  const resp = await fetch(`/api/checks/${checkId}`);
+  if (!resp.ok) return;
+  const { check, results } = await resp.json();
+  const stale = check.stale;
+  const banner = stale
+    ? `<div class="stale-banner">此核查结论已<b>过期</b>，不能作为现行缺口。
+         ${esc(check.status_detail || '')} 请基于最新输入重新核查。</div>` : '';
+  const groups = {
+    MISSED: results.filter(r => r.status === 'MISSED'),
+    MATCHED: results.filter(r => r.status === 'MATCHED'),
+    OTHER: results.filter(r => r.status === 'MIS_SCHEDULED' || r.status === 'PENDING_REVIEW'),
+  };
+  function table(list, withSource) {
+    if (!list.length) return '<p class="hint">（无）</p>';
+    return `<div class="scroll"><table><thead><tr>
+      <th>账户</th><th>表号</th><th>应采时刻 (UTC)</th><th>状态</th>
+      ${withSource ? '<th>来源读数 ID</th><th>实读时刻 (UTC)</th><th>偏差 (分钟)</th><th>实读值</th>' : '<th>说明代码</th>'}
+    </tr></thead><tbody>` + list.map(r => `
+      <tr><td>${esc(r.account)}</td><td>${esc(r.meter)}</td>
+        <td>${esc(r.planned_at)}</td>
+        <td><span class="badge ${r.status}">${esc(check_status(r.status))}</span></td>
+        ${withSource
+          ? `<td>${esc(r.match_reading_id ?? '')}</td><td>${esc(r.match_read_at ?? '')}</td>
+             <td>${r.delta_seconds == null ? '' : (r.delta_seconds / 60).toFixed(1)}</td>
+             <td>${esc(r.match_reading_cum ?? '')}</td>`
+          : `<td>${esc(r.detail ?? '')}</td>`}
+      </tr>`).join('') + '</tbody></table></div>';
+  }
+  document.getElementById('checkDetail').innerHTML = `
+    ${banner}
+    <h2 style="margin-top:18px">核查 #${check.id} 明细
+      <span class="badge ${stale ? 'expired' : 'active'}">${stale ? '过期' : '现行'}</span></h2>
+    <p class="hint">所用输入：计划批次 ${check.plan_batch_id}
+      · 读数批次 ${esc(check.reading_batch_ids)}
+      · 换表批次 ${esc(check.replacement_batch_id ?? '（无）')}</p>
+    <h3 style="font-size:14px;color:var(--red)">漏采点（${groups.MISSED.length}）— 需补采</h3>
+    ${table(groups.MISSED, false)}
+    <h3 style="font-size:14px;color:var(--green);margin-top:16px">已核销点及来源读数（${groups.MATCHED.length}）</h3>
+    ${table(groups.MATCHED, true)}
+    <h3 style="font-size:14px;color:var(--amber);margin-top:16px">错排 / 待核（${groups.OTHER.length}，均不计漏采）</h3>
+    ${table(groups.OTHER, false)}`;
+}
+
+function check_status(code) {
+  return CHECK_STATUS_LABEL[code] || code;
+}
+
+async function loadAll(showCheckId) {
+  loadChecks(showCheckId);
   const [gResp, bResp] = await Promise.all([
     fetch('/api/generations'), fetch('/api/batches')]);
   const gens = (await gResp.json()).generations;

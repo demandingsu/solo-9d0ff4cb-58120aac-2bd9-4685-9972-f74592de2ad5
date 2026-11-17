@@ -14,6 +14,14 @@ from pydantic import BaseModel
 from .compute import GenerationError, generate_generation, reason_label
 from .database import get_connection, init_db
 from .ingestion import BatchRejected, ingest_readings, ingest_replacements
+from .plan import (
+    CheckError,
+    STATUS_LABELS,
+    check_summary_sql,
+    create_check,
+    ingest_plan,
+    record_rejected_plan,
+)
 
 
 @asynccontextmanager
@@ -248,6 +256,203 @@ def generation_rows(generation_id: int, limit: int = 1000):
         for r in rows:
             r["review_reason_detail"] = reason_label(r["review_reason"])
         return {"generation_id": generation_id, "rows": rows}
+    finally:
+        conn.close()
+
+
+@app.post("/api/uploads/plans", response_model=Message)
+def upload_plan(file: UploadFile = File(...)):
+    text = _text_of(file)
+    conn = get_connection()
+    try:
+        try:
+            detail = ingest_plan(conn, file.filename or "plan.csv", text)
+        except BatchRejected as exc:
+            record_rejected_plan(conn, file.filename or "plan.csv", exc.reason)
+            raise HTTPException(status_code=422, detail=exc.reason) from exc
+        return Message(
+            ok=True,
+            message=f"抄表计划整版上传成功：载入 {detail['rows']} 个计划点，"
+                    f"旧版计划已被替换；现有核查结论已标过期",
+            detail=detail,
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/api/checks", response_model=Message)
+def create_gap_check():
+    conn = get_connection()
+    try:
+        try:
+            detail = create_check(conn)
+        except CheckError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Message(
+            ok=True,
+            message=f"核查 #{detail['check_id']} 完成：计划 {detail['total_points']} 点，"
+                    f"已核销 {detail['matched']}，漏采 {detail['missed']}，"
+                    f"错排 {detail['mis_scheduled']}，待核 {detail['pending_review']}",
+            detail=detail,
+        )
+    finally:
+        conn.close()
+
+
+def _check_snapshot_state(conn: sqlite3.Connection, check: sqlite3.Row) -> tuple[bool, bool]:
+    """Return (inputs_changed, stale) for a stored check.
+
+    The check's recorded batch ids are the authoritative snapshot.  We also
+    recompute the current committed batch ids so a missed expiry can never let
+    an old conclusion masquerade as the current gap.
+    """
+    current_plan = conn.execute(
+        """SELECT id FROM plan_batches
+            WHERE status='committed' ORDER BY id DESC LIMIT 1""").fetchone()
+    current_readings = [
+        int(r["id"]) for r in conn.execute(
+            """SELECT id FROM upload_batches
+                WHERE batch_type='reading' AND status='committed' ORDER BY id""")
+    ]
+    current_repl = conn.execute(
+        """SELECT id FROM upload_batches
+            WHERE batch_type='replacement' AND status='committed'
+            ORDER BY id DESC LIMIT 1""").fetchone()
+    inputs_changed = (
+        check["plan_batch_id"] != (current_plan["id"] if current_plan else None)
+        or check["reading_batch_ids"] != ",".join(str(i) for i in current_readings)
+        or check["replacement_batch_id"] != (current_repl["id"] if current_repl else None)
+    )
+    return bool(inputs_changed), check["status"] != "active" or inputs_changed
+
+
+@app.get("/api/checks")
+def list_checks():
+    conn = get_connection()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            check_summary_sql() + " ORDER BY c.id DESC")]
+        for r in rows:
+            for key in ("total_points", "matched", "missed",
+                        "mis_scheduled", "pending_review"):
+                r[key] = r[key] or 0
+            _, r["stale"] = _check_snapshot_state(conn, r)
+        return {"checks": rows}
+    finally:
+        conn.close()
+
+
+@app.get("/api/checks/{check_id}")
+def check_detail(check_id: int):
+    conn = get_connection()
+    try:
+        check = conn.execute(
+            check_summary_sql() + " HAVING c.id=?", (check_id,)).fetchone()
+        if check is None:
+            raise HTTPException(status_code=404, detail=f"不存在核查 #{check_id}")
+        inputs_changed, stale = _check_snapshot_state(conn, check)
+        rows = [dict(r) for r in conn.execute(
+            """SELECT * FROM check_results
+                WHERE check_id=? ORDER BY planned_at, id""", (check_id,))]
+        for r in rows:
+            r["status_label"] = STATUS_LABELS.get(r["status"], r["status"])
+        result = dict(check)
+        for key in ("total_points", "matched", "missed",
+                    "mis_scheduled", "pending_review"):
+            result[key] = result[key] or 0
+        result["inputs_changed"] = inputs_changed
+        result["stale"] = stale
+        return {"check": result, "results": rows}
+    finally:
+        conn.close()
+
+
+@app.get("/api/checks/{check_id}/download")
+def download_check(check_id: int):
+    conn = get_connection()
+    try:
+        check = conn.execute(
+            "SELECT * FROM checks WHERE id=?", (check_id,)).fetchone()
+        if check is None:
+            raise HTTPException(status_code=404, detail=f"不存在核查 #{check_id}")
+        inputs_changed, stale = _check_snapshot_state(conn, check)
+        rows = conn.execute(
+            """SELECT * FROM check_results
+                WHERE check_id=? ORDER BY planned_at, id""", (check_id,)).fetchall()
+
+        def iter_csv():
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)
+            writer.writerow(["check_id", "check_status", "stale",
+                             "plan_batch_id", "reading_batch_ids",
+                             "replacement_batch_id",
+                             "account", "meter", "planned_at_utc", "status",
+                             "status_label", "match_reading_id",
+                             "match_read_at_utc", "match_reading_cum",
+                             "delta_seconds", "detail"])
+            yield buffer.getvalue()
+            for r in rows:
+                buffer = io.StringIO()
+                writer = csv.writer(buffer)
+                writer.writerow([
+                    check_id, check["status"], "yes" if stale else "no",
+                    check["plan_batch_id"],
+                    check["reading_batch_ids"],
+                    "" if check["replacement_batch_id"] is None
+                    else check["replacement_batch_id"],
+                    r["account"], r["meter"], r["planned_at"], r["status"],
+                    STATUS_LABELS.get(r["status"], r["status"]),
+                    "" if r["match_reading_id"] is None else r["match_reading_id"],
+                    r["match_read_at"] or "",
+                    "" if r["match_reading_cum"] is None else r["match_reading_cum"],
+                    "" if r["delta_seconds"] is None else r["delta_seconds"],
+                    r["detail"] or "",
+                ])
+                yield buffer.getvalue()
+
+        headers = {
+            "Content-Disposition":
+                f'attachment; filename="gap_check_{check_id}.csv"',
+            "X-Check-Status": check["status"],
+            "X-Check-Stale": "true" if stale else "false",
+        }
+        return StreamingResponse(
+            iter_csv(), media_type="text/csv; charset=utf-8", headers=headers)
+    finally:
+        conn.close()
+
+
+@app.get("/api/plan-points")
+def list_plan_points(batch_id: int | None = None):
+    """Read-only listing helper used by the UI when no check has been run."""
+    conn = get_connection()
+    try:
+        if batch_id is None:
+            row = conn.execute(
+                """SELECT id FROM plan_batches
+                    WHERE status='committed' ORDER BY id DESC LIMIT 1""").fetchone()
+            batch_id = row["id"] if row else None
+        if batch_id is None:
+            return {"plan_batch": None, "points": []}
+        batch = conn.execute("SELECT * FROM plan_batches WHERE id=?",
+                             (batch_id,)).fetchone()
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"不存在计划批次 {batch_id}")
+        points = [dict(r) for r in conn.execute(
+            """SELECT id, account, meter, planned_at FROM plan_points
+                WHERE batch_id=? ORDER BY planned_at, id""", (batch_id,))]
+        return {"plan_batch": dict(batch), "points": points}
+    finally:
+        conn.close()
+
+
+@app.get("/api/plans")
+def list_plans():
+    conn = get_connection()
+    try:
+        plans = [dict(r) for r in conn.execute(
+            "SELECT * FROM plan_batches ORDER BY id DESC")]
+        return {"plans": plans}
     finally:
         conn.close()
 
